@@ -56,8 +56,8 @@ def two_way_demean(arr: np.ndarray, ids: np.ndarray, times: np.ndarray) -> np.nd
     df_tmp = pd.DataFrame({'id': ids, 'time': times})
     for j in range(arr.shape[1]):
         s = pd.Series(arr[:, j])
-        mean_i = s.groupby(df_tmp['id']).transform('mean').to_numpy()
-        mean_t = s.groupby(df_tmp['time']).transform('mean').to_numpy()
+        mean_i = s.groupby(df_tmp['id'], observed=False).transform('mean').to_numpy()
+        mean_t = s.groupby(df_tmp['time'], observed=False).transform('mean').to_numpy()
         mean_all = float(s.mean())
         out[:, j] = s.to_numpy() - mean_i - mean_t + mean_all
 
@@ -243,7 +243,18 @@ class TwoWayFESDM:
 
         opt = minimize(self.neg_ll, x0, method='L-BFGS-B', bounds=bounds)
         if not opt.success:
-            raise RuntimeError(f'优化失败：{opt.message}')
+            # 备选优化器，提升复杂样本（如 lag2/lag3）收敛率
+            opt2 = minimize(
+                self.neg_ll,
+                x0,
+                method='Powell',
+                bounds=bounds,
+                options={'maxiter': 20000, 'xtol': 1e-6, 'ftol': 1e-6},
+            )
+            if opt2.success:
+                opt = opt2
+            else:
+                raise RuntimeError(f'优化失败：L-BFGS-B={opt.message}; Powell={opt2.message}')
 
         self.params_ = opt.x
         self.llf_ = -float(opt.fun)
@@ -474,7 +485,7 @@ class TwoWayFESDM:
         z = (s_inv_raw - s_inv_raw.mean()) / (s_inv_raw.std(ddof=1) + 1e-12)
         extreme_cnt = int((np.abs(z) > 3).sum())
 
-        ychg = self.df.sort_values(['region', 'year']).groupby('region')['ln_inv_l1'].diff()
+        ychg = self.df.sort_values(['region', 'year']).groupby('region', observed=False)['ln_inv_l1'].diff()
         jump_thr = float(3.0 * ychg.std(ddof=1)) if np.isfinite(ychg.std(ddof=1)) else np.nan
         jump_cnt = int((np.abs(ychg) > jump_thr).sum()) if np.isfinite(jump_thr) else 0
         outlier_table = pd.DataFrame([
@@ -545,7 +556,7 @@ def main():
             return df_in.copy(), 'ln_inv_l1'
         col = f'ln_inv_l{lag_order}'
         tmp = df_in.sort_values(['region', 'year']).copy()
-        tmp[col] = tmp.groupby('region')['ln_inv_l1'].shift(lag_order - 1)
+        tmp[col] = tmp.groupby('region', observed=False)['ln_inv_l1'].shift(lag_order - 1)
         tmp = tmp.dropna(subset=[col]).copy()
         return tmp, col
 
@@ -555,20 +566,36 @@ def main():
         for lag in [1, 2, 3]:
             dlag, inv_col = build_lag_df(df_base, lag)
             x_full = [inv_col, 'ln_gdppc', 'urb', 'ind2', 'rd']
-            m = TwoWayFESDM(dlag, W, x_names=x_full, include_wx=True).fit()
-            r = m.result_table_.set_index('变量')
-            rows.append({
-                '实验': f'lag{lag}_full_sdm',
-                '样本量': len(dlag),
-                'AIC': m.aic_,
-                'BIC': m.bic_,
-                '投资项': inv_col,
-                '投资系数': float(r.loc[inv_col, '系数']),
-                '投资标准误': float(r.loc[inv_col, '标准误']),
-                '投资p值': float(r.loc[inv_col, 'p值']),
-                '投资稳健p值': float(r.loc[inv_col, '稳健p值(线性部分)']),
-                '条件数': float(np.linalg.cond(m.Z)),
-            })
+            try:
+                m = TwoWayFESDM(dlag, W, x_names=x_full, include_wx=True).fit()
+                r = m.result_table_.set_index('变量')
+                rows.append({
+                    '实验': f'lag{lag}_full_sdm',
+                    '样本量': len(dlag),
+                    'AIC': m.aic_,
+                    'BIC': m.bic_,
+                    '投资项': inv_col,
+                    '投资系数': float(r.loc[inv_col, '系数']),
+                    '投资标准误': float(r.loc[inv_col, '标准误']),
+                    '投资p值': float(r.loc[inv_col, 'p值']),
+                    '投资稳健p值': float(r.loc[inv_col, '稳健p值(线性部分)']),
+                    '条件数': float(np.linalg.cond(m.Z)),
+                    '状态': 'ok',
+                })
+            except Exception as ex:
+                rows.append({
+                    '实验': f'lag{lag}_full_sdm',
+                    '样本量': len(dlag),
+                    'AIC': np.nan,
+                    'BIC': np.nan,
+                    '投资项': inv_col,
+                    '投资系数': np.nan,
+                    '投资标准误': np.nan,
+                    '投资p值': np.nan,
+                    '投资稳健p值': np.nan,
+                    '条件数': np.nan,
+                    '状态': f'fail: {ex}',
+                })
 
         # 分步回归（lag1）
         specs = [
@@ -578,20 +605,36 @@ def main():
             ('step4_full_sdm', ['ln_inv_l1', 'ln_gdppc', 'urb', 'ind2', 'rd'], True),
         ]
         for name, xs, use_wx in specs:
-            m = TwoWayFESDM(df_base, W, x_names=xs, include_wx=use_wx).fit()
-            r = m.result_table_.set_index('变量')
-            rows.append({
-                '实验': name,
-                '样本量': len(df_base),
-                'AIC': m.aic_,
-                'BIC': m.bic_,
-                '投资项': 'ln_inv_l1',
-                '投资系数': float(r.loc['ln_inv_l1', '系数']),
-                '投资标准误': float(r.loc['ln_inv_l1', '标准误']),
-                '投资p值': float(r.loc['ln_inv_l1', 'p值']),
-                '投资稳健p值': float(r.loc['ln_inv_l1', '稳健p值(线性部分)']),
-                '条件数': float(np.linalg.cond(m.Z)),
-            })
+            try:
+                m = TwoWayFESDM(df_base, W, x_names=xs, include_wx=use_wx).fit()
+                r = m.result_table_.set_index('变量')
+                rows.append({
+                    '实验': name,
+                    '样本量': len(df_base),
+                    'AIC': m.aic_,
+                    'BIC': m.bic_,
+                    '投资项': 'ln_inv_l1',
+                    '投资系数': float(r.loc['ln_inv_l1', '系数']),
+                    '投资标准误': float(r.loc['ln_inv_l1', '标准误']),
+                    '投资p值': float(r.loc['ln_inv_l1', 'p值']),
+                    '投资稳健p值': float(r.loc['ln_inv_l1', '稳健p值(线性部分)']),
+                    '条件数': float(np.linalg.cond(m.Z)),
+                    '状态': 'ok',
+                })
+            except Exception as ex:
+                rows.append({
+                    '实验': name,
+                    '样本量': len(df_base),
+                    'AIC': np.nan,
+                    'BIC': np.nan,
+                    '投资项': 'ln_inv_l1',
+                    '投资系数': np.nan,
+                    '投资标准误': np.nan,
+                    '投资p值': np.nan,
+                    '投资稳健p值': np.nan,
+                    '条件数': np.nan,
+                    '状态': f'fail: {ex}',
+                })
 
         out = pd.DataFrame(rows)
         out.to_excel('W1_sensitivity_checks.xlsx', index=False)
