@@ -149,12 +149,13 @@ class TwoWayFESDM:
     两维固定效应 SDM 的一个轻量实现。
     """
 
-    def __init__(self, df: pd.DataFrame, W: np.ndarray, x_names=None):
+    def __init__(self, df: pd.DataFrame, W: np.ndarray, x_names=None, include_wx: bool = True):
         self.df = df.copy()
         self.W = W
         self.N = len(REGIONS)
         self.T = self.df['year'].nunique()
         self.n = len(self.df)
+        self.include_wx = include_wx
 
         if x_names is None:
             x_names = ['ln_inv_l1', 'ln_gdppc', 'urb', 'ind2', 'rd']
@@ -171,12 +172,16 @@ class TwoWayFESDM:
         self.X_dm = two_way_demean(self.X, self.ids, self.times)
         self.Wy = spatial_lag_long(self.y.ravel(), self.W, self.N)
         self.Wy_dm = two_way_demean(self.Wy, self.ids, self.times)
-        self.WX = np.hstack([spatial_lag_long(self.X[:, j], self.W, self.N) for j in range(self.X.shape[1])])
-        self.WX_dm = two_way_demean(self.WX, self.ids, self.times)
-        
-
-        self.Z = np.hstack([self.X_dm, self.WX_dm])
-        self.coef_names = self.x_names + [f'W_{x}' for x in self.x_names]
+        if self.include_wx:
+            self.WX = np.hstack([spatial_lag_long(self.X[:, j], self.W, self.N) for j in range(self.X.shape[1])])
+            self.WX_dm = two_way_demean(self.WX, self.ids, self.times)
+            self.Z = np.hstack([self.X_dm, self.WX_dm])
+            self.coef_names = self.x_names + [f'W_{x}' for x in self.x_names]
+        else:
+            self.WX = None
+            self.WX_dm = None
+            self.Z = self.X_dm.copy()
+            self.coef_names = self.x_names.copy()
 
         self.evals = np.linalg.eigvals(self.W)
 
@@ -184,6 +189,9 @@ class TwoWayFESDM:
         self.result_table_ = None
         self.impact_table_ = None
         self.diagnostic_tables_ = None
+        self.llf_ = None
+        self.aic_ = None
+        self.bic_ = None
 
     def logdet_A(self, rho: float) -> float:
         vals = 1.0 - rho * self.evals
@@ -238,21 +246,41 @@ class TwoWayFESDM:
             raise RuntimeError(f'优化失败：{opt.message}')
 
         self.params_ = opt.x
+        self.llf_ = -float(opt.fun)
+        k_all = len(self.params_)
+        self.aic_ = 2.0 * k_all - 2.0 * self.llf_
+        self.bic_ = np.log(self.n) * k_all - 2.0 * self.llf_
 
         # 近似标准误：数值 Hessian
         H = approx_hess(opt.x, self.neg_ll)
-        cov = np.linalg.inv(H)
+        cov = np.linalg.pinv(H)
         se = np.sqrt(np.diag(cov))
         zval = self.params_ / se
         pval = 2.0 * (1.0 - norm.cdf(np.abs(zval)))
 
+        # 线性部分的异方差稳健近似标准误（rho 固定条件下）
+        k = self.Z.shape[1]
+        beta = np.asarray(self.params_[1:1 + k]).reshape(-1, 1)
+        Ay = self.y_dm - float(self.params_[0]) * self.Wy_dm
+        e = Ay - self.Z @ beta
+        XtX_inv = np.linalg.pinv(self.Z.T @ self.Z)
+        meat = self.Z.T @ ((e ** 2) * self.Z)
+        vcov_beta_robust = XtX_inv @ meat @ XtX_inv
+        se_beta_robust = np.sqrt(np.clip(np.diag(vcov_beta_robust), a_min=0, a_max=None))
+
         param_names = ['rho'] + self.coef_names + ['log_sigma2']
+        se_robust = np.r_[np.nan, se_beta_robust, np.nan]
+        z_robust = self.params_ / se_robust
+        p_robust = 2.0 * (1.0 - norm.cdf(np.abs(z_robust)))
         self.result_table_ = pd.DataFrame({
             '变量': param_names,
             '系数': self.params_,
             '标准误': se,
             'z值': zval,
             'p值': pval,
+            '稳健标准误(线性部分)': se_robust,
+            '稳健z值(线性部分)': z_robust,
+            '稳健p值(线性部分)': p_robust,
         })
 
         self._calc_impacts(cov)
@@ -273,7 +301,7 @@ class TwoWayFESDM:
         rows = []
         for x in self.x_names:
             beta = float(coeffs[x])
-            theta = float(coeffs[f'W_{x}'])
+            theta = float(coeffs.get(f'W_{x}', 0.0))
 
             S = A_inv @ (beta * np.eye(self.N) + theta * self.W)
             direct = float(np.trace(S) / self.N)
@@ -380,8 +408,9 @@ class TwoWayFESDM:
             if x == 'ln_inv_l1':
                 continue
             corr_rows.append([x, self._corr(inv, self.X_dm[:, i])])
-        for i, x in enumerate(self.x_names):
-            corr_rows.append([f'W_{x}', self._corr(inv, self.WX_dm[:, i])])
+        if self.include_wx and self.WX_dm is not None:
+            for i, x in enumerate(self.x_names):
+                corr_rows.append([f'W_{x}', self._corr(inv, self.WX_dm[:, i])])
         corr_table = pd.DataFrame(corr_rows, columns=['变量', 'corr(ln_inv_l1, ·)'])
 
         # 3) 条件数（基于 Z）
@@ -410,11 +439,57 @@ class TwoWayFESDM:
             vif_rows.append([names[j], r2, vif])
         vif_table = pd.DataFrame(vif_rows, columns=['变量', 'R2(对其余解释变量回归)', 'VIF'])
 
+        # 5) 自动判读：投资项不显著的主要风险来源
+        inv_std = float(std_table.loc[std_table['变量'] == 'ln_inv_l1', '去均值后标准差'].iloc[0])
+        median_std = float(std_table['去均值后标准差'].median())
+        weak_id_flag = inv_std < max(1e-8, 0.25 * median_std)
+
+        corr_abs_max = float(np.nanmax(np.abs(corr_table['corr(ln_inv_l1, ·)'].to_numpy(dtype=float))))
+        high_corr_flag = corr_abs_max >= 0.7
+
+        vif_inv = float(vif_table.loc[vif_table['变量'] == 'ln_inv_l1', 'VIF'].iloc[0])
+        vif_flag = vif_inv >= 5.0
+
+        cond_flag = cond_number >= 1000.0
+        if vif_flag or high_corr_flag:
+            primary_reason = '共线性主导'
+        elif weak_id_flag:
+            primary_reason = '识别偏弱主导'
+        elif cond_flag:
+            primary_reason = '整体矩阵病态（尺度/近共线）主导'
+        else:
+            primary_reason = '未见强共线性，可能是统计功效不足'
+
+        assess_rows = [
+            ['ln_inv_l1去均值后标准差', inv_std, '低于中位数25%则提示识别偏弱', weak_id_flag],
+            ['ln_inv_l1相关性最大绝对值', corr_abs_max, '>=0.7 视为高相关', high_corr_flag],
+            ['ln_inv_l1的VIF', vif_inv, '>=5 视为明显共线性', vif_flag],
+            ['设计矩阵条件数', cond_number, '>=1000 视为病态风险较高', cond_flag],
+            ['自动判读', primary_reason, '用于解释投资项p值偏大', np.nan],
+        ]
+        assess_table = pd.DataFrame(assess_rows, columns=['指标', '数值', '判据', '是否触发'])
+
+        # 6) 投资变量极端值与口径突变检测
+        s_inv_raw = self.df['ln_inv_l1'].astype(float)
+        z = (s_inv_raw - s_inv_raw.mean()) / (s_inv_raw.std(ddof=1) + 1e-12)
+        extreme_cnt = int((np.abs(z) > 3).sum())
+
+        ychg = self.df.sort_values(['region', 'year']).groupby('region')['ln_inv_l1'].diff()
+        jump_thr = float(3.0 * ychg.std(ddof=1)) if np.isfinite(ychg.std(ddof=1)) else np.nan
+        jump_cnt = int((np.abs(ychg) > jump_thr).sum()) if np.isfinite(jump_thr) else 0
+        outlier_table = pd.DataFrame([
+            ['|z(ln_inv_l1)| > 3 的观测数', extreme_cnt],
+            ['ln_inv_l1 年度跳变阈值(3σ)', jump_thr],
+            ['|Δln_inv_l1| > 3σ 的观测数', jump_cnt],
+        ], columns=['指标', '数值'])
+
         self.diagnostic_tables_ = {
             'std': std_table,
             'corr_inv': corr_table,
             'condition_number': cond_table,
             'vif': vif_table,
+            'assessment': assess_table,
+            'outlier_check': outlier_table,
         }
 
         if verbose:
@@ -430,12 +505,20 @@ class TwoWayFESDM:
             print('\n========== 诊断模式：VIF ==========')
             print(vif_table.round(6).to_string(index=False))
 
+            print('\n========== 诊断模式：自动判读 ==========')
+            print(assess_table.to_string(index=False))
+
+            print('\n========== 诊断模式：投资变量极端值/口径突变检查 ==========')
+            print(outlier_table.to_string(index=False))
+
         if out_path:
             with pd.ExcelWriter(out_path) as writer:
                 std_table.to_excel(writer, sheet_name='std_demeaned', index=False)
                 corr_table.to_excel(writer, sheet_name='corr_with_ln_inv_l1', index=False)
                 cond_table.to_excel(writer, sheet_name='condition_number', index=False)
                 vif_table.to_excel(writer, sheet_name='vif', index=False)
+                assess_table.to_excel(writer, sheet_name='assessment', index=False)
+                outlier_table.to_excel(writer, sheet_name='outlier_check', index=False)
 
     def save_results(self, out_prefix='sdm_main'):
         assert self.result_table_ is not None and self.impact_table_ is not None, '请先 fit()'
@@ -444,6 +527,77 @@ class TwoWayFESDM:
 
 
 def main():
+    def standardize_columns(df_in: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+        df_out = df_in.copy()
+        for c in cols:
+            s = df_out[c].astype(float)
+            sd = float(s.std(ddof=1))
+            if sd > 0:
+                df_out[c] = (s - float(s.mean())) / sd
+        return df_out
+
+    def build_lag_df(df_in: pd.DataFrame, lag_order: int) -> tuple[pd.DataFrame, str]:
+        """
+        lag_order=1: 使用 ln_inv_l1
+        lag_order=2/3: 在地区内继续向后平移 1/2 期
+        """
+        if lag_order == 1:
+            return df_in.copy(), 'ln_inv_l1'
+        col = f'ln_inv_l{lag_order}'
+        tmp = df_in.sort_values(['region', 'year']).copy()
+        tmp[col] = tmp.groupby('region')['ln_inv_l1'].shift(lag_order - 1)
+        tmp = tmp.dropna(subset=[col]).copy()
+        return tmp, col
+
+    def run_stepwise_and_lag_checks(df_base: pd.DataFrame, W: np.ndarray):
+        rows = []
+        # 投资滞后 1/2/3 期 + 全模型（含 WX）
+        for lag in [1, 2, 3]:
+            dlag, inv_col = build_lag_df(df_base, lag)
+            x_full = [inv_col, 'ln_gdppc', 'urb', 'ind2', 'rd']
+            m = TwoWayFESDM(dlag, W, x_names=x_full, include_wx=True).fit()
+            r = m.result_table_.set_index('变量')
+            rows.append({
+                '实验': f'lag{lag}_full_sdm',
+                '样本量': len(dlag),
+                'AIC': m.aic_,
+                'BIC': m.bic_,
+                '投资项': inv_col,
+                '投资系数': float(r.loc[inv_col, '系数']),
+                '投资标准误': float(r.loc[inv_col, '标准误']),
+                '投资p值': float(r.loc[inv_col, 'p值']),
+                '投资稳健p值': float(r.loc[inv_col, '稳健p值(线性部分)']),
+                '条件数': float(np.linalg.cond(m.Z)),
+            })
+
+        # 分步回归（lag1）
+        specs = [
+            ('step1_core_no_wx', ['ln_inv_l1'], False),
+            ('step2_core_with_wx', ['ln_inv_l1'], True),
+            ('step3_add_controls_no_wx', ['ln_inv_l1', 'ln_gdppc', 'urb', 'ind2', 'rd'], False),
+            ('step4_full_sdm', ['ln_inv_l1', 'ln_gdppc', 'urb', 'ind2', 'rd'], True),
+        ]
+        for name, xs, use_wx in specs:
+            m = TwoWayFESDM(df_base, W, x_names=xs, include_wx=use_wx).fit()
+            r = m.result_table_.set_index('变量')
+            rows.append({
+                '实验': name,
+                '样本量': len(df_base),
+                'AIC': m.aic_,
+                'BIC': m.bic_,
+                '投资项': 'ln_inv_l1',
+                '投资系数': float(r.loc['ln_inv_l1', '系数']),
+                '投资标准误': float(r.loc['ln_inv_l1', '标准误']),
+                '投资p值': float(r.loc['ln_inv_l1', 'p值']),
+                '投资稳健p值': float(r.loc['ln_inv_l1', '稳健p值(线性部分)']),
+                '条件数': float(np.linalg.cond(m.Z)),
+            })
+
+        out = pd.DataFrame(rows)
+        out.to_excel('W1_sensitivity_checks.xlsx', index=False)
+        print('\n========== 敏感性分析（滞后/分步/稳健SE） ==========')
+        print(out.round(4).to_string(index=False))
+
     # 1. 读取主样本
     df = load_panel_data(
         data_path='data/相关系数矩阵(1).xlsx',
@@ -478,6 +632,24 @@ def main():
     model2.run_diagnostics(out_path='W2_sdm_diagnostics.xlsx', verbose=True)
     model2.save_results('W2_sdm')
 
+    # 4. 用户关注项专项检查（以 W1 为主）
+    # 4.1 变量标准化后重估（查看条件数是否下降）
+    x_base = ['ln_inv_l1', 'ln_gdppc', 'urb', 'ind2', 'rd']
+    df_std = standardize_columns(df, x_base)
+    model1_std = TwoWayFESDM(df_std, W1, x_names=x_base, include_wx=True).fit()
+    cond_raw = float(np.linalg.cond(model1.Z))
+    cond_std = float(np.linalg.cond(model1_std.Z))
+    pd.DataFrame(
+        [{'模型': 'W1_raw', '条件数': cond_raw}, {'模型': 'W1_standardized_X', '条件数': cond_std}]
+    ).to_excel('W1_condition_number_compare.xlsx', index=False)
+    print('\n========== 标准化前后条件数对比（W1） ==========')
+    print(pd.DataFrame(
+        [{'模型': 'W1_raw', '条件数': cond_raw}, {'模型': 'W1_standardized_X', '条件数': cond_std}]
+    ).round(4).to_string(index=False))
+
+    # 4.2 投资滞后2/3期 + 分步回归 + 稳健SE对比
+    run_stepwise_and_lag_checks(df, W1)
+
     print('\n结果已保存：')
     print('- W1_sdm_coef.xlsx')
     print('- W1_sdm_impacts.xlsx')
@@ -485,6 +657,8 @@ def main():
     print('- W2_sdm_impacts.xlsx')
     print('- W1_sdm_diagnostics.xlsx')
     print('- W2_sdm_diagnostics.xlsx')
+    print('- W1_condition_number_compare.xlsx')
+    print('- W1_sensitivity_checks.xlsx')
 
 
 if __name__ == '__main__':
