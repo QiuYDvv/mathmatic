@@ -169,6 +169,8 @@ class TwoWayFESDM:
         # 双向去均值
         self.y_dm = two_way_demean(self.y, self.ids, self.times)
         self.X_dm = two_way_demean(self.X, self.ids, self.times)
+        self.Wy = spatial_lag_long(self.y.ravel(), self.W, self.N)
+        self.Wy_dm = two_way_demean(self.Wy, self.ids, self.times)
         self.WX = np.hstack([spatial_lag_long(self.X[:, j], self.W, self.N) for j in range(self.X.shape[1])])
         self.WX_dm = two_way_demean(self.WX, self.ids, self.times)
         
@@ -181,6 +183,7 @@ class TwoWayFESDM:
         self.params_ = None
         self.result_table_ = None
         self.impact_table_ = None
+        self.diagnostic_tables_ = None
 
     def logdet_A(self, rho: float) -> float:
         vals = 1.0 - rho * self.evals
@@ -202,8 +205,7 @@ class TwoWayFESDM:
         if not np.isfinite(logdet):
             return 1e12
 
-        Wy_dm = spatial_lag_long(self.y_dm.ravel(), self.W, self.N)
-        Ay = self.y_dm - rho * Wy_dm
+        Ay = self.y_dm - rho * self.Wy_dm
         e = Ay - self.Z @ beta
         rss = float((e.T @ e).item())
 
@@ -213,8 +215,7 @@ class TwoWayFESDM:
     def fit(self):
         # 初值：先做 profile 思路给 rho 初始值
         def profile_obj(rho: float) -> float:
-            Wy_dm = spatial_lag_long(self.y_dm.ravel(), self.W, self.N)
-            Ay = self.y_dm - rho * Wy_dm
+            Ay = self.y_dm - rho * self.Wy_dm
             b = np.linalg.lstsq(self.Z, Ay, rcond=None)[0]
             e = Ay - self.Z @ b
             sigma2 = float((e.T @ e).item() / self.n)
@@ -224,8 +225,7 @@ class TwoWayFESDM:
         from scipy.optimize import minimize_scalar
         rho0 = minimize_scalar(profile_obj, bounds=(-0.95, 0.95), method='bounded').x
 
-        Wy_dm = spatial_lag_long(self.y_dm.ravel(), self.W, self.N)
-        Ay0 = self.y_dm - rho0 * Wy_dm
+        Ay0 = self.y_dm - rho0 * self.Wy_dm
         b0 = np.linalg.lstsq(self.Z, Ay0, rcond=None)[0]
         e0 = Ay0 - self.Z @ b0
         sigma20 = float((e0.T @ e0).item() / self.n)
@@ -343,6 +343,100 @@ class TwoWayFESDM:
 
         self.impact_table_ = impacts
 
+    @staticmethod
+    def _corr(a: np.ndarray, b: np.ndarray) -> float:
+        a = np.asarray(a, dtype=float).ravel()
+        b = np.asarray(b, dtype=float).ravel()
+        if a.size != b.size or a.size < 3:
+            return np.nan
+        sa = np.std(a, ddof=1)
+        sb = np.std(b, ddof=1)
+        if sa <= 0 or sb <= 0:
+            return np.nan
+        return float(np.corrcoef(a, b)[0, 1])
+
+    def run_diagnostics(self, out_path: str | None = None, verbose: bool = True):
+        """
+        诊断模式：
+        1) 去均值后变量标准差
+        2) ln_inv_l1 与其余变量/空间滞后项相关性
+        3) 条件数
+        4) VIF
+        """
+        # 1) 去均值后标准差
+        std_rows = []
+        std_rows.append(['y_dm', float(np.std(self.y_dm, ddof=1))])
+        for i, x in enumerate(self.x_names):
+            std_rows.append([x, float(np.std(self.X_dm[:, i], ddof=1))])
+        for i, x in enumerate(self.x_names):
+            std_rows.append([f'W_{x}', float(np.std(self.WX_dm[:, i], ddof=1))])
+        std_table = pd.DataFrame(std_rows, columns=['变量', '去均值后标准差'])
+
+        # 2) 与 ln_inv_l1 的相关性（含空间滞后项）
+        corr_rows = []
+        inv = self.X_dm[:, self.x_names.index('ln_inv_l1')]
+
+        for i, x in enumerate(self.x_names):
+            if x == 'ln_inv_l1':
+                continue
+            corr_rows.append([x, self._corr(inv, self.X_dm[:, i])])
+        for i, x in enumerate(self.x_names):
+            corr_rows.append([f'W_{x}', self._corr(inv, self.WX_dm[:, i])])
+        corr_table = pd.DataFrame(corr_rows, columns=['变量', 'corr(ln_inv_l1, ·)'])
+
+        # 3) 条件数（基于 Z）
+        cond_number = float(np.linalg.cond(self.Z))
+        cond_table = pd.DataFrame([['Z', cond_number]], columns=['矩阵', '条件数'])
+
+        # 4) VIF（基于 Z）
+        vif_rows = []
+        names = self.coef_names
+        Z = self.Z
+        ncol = Z.shape[1]
+
+        for j in range(ncol):
+            yj = Z[:, j]
+            Xo = np.delete(Z, j, axis=1)
+            b = np.linalg.lstsq(Xo, yj, rcond=None)[0]
+            yhat = Xo @ b
+            sst = float(np.sum((yj - yj.mean()) ** 2))
+            ssr = float(np.sum((yj - yhat) ** 2))
+            if sst <= 1e-12:
+                r2 = np.nan
+                vif = np.nan
+            else:
+                r2 = max(0.0, min(1.0, 1.0 - ssr / sst))
+                vif = np.inf if (1.0 - r2) <= 1e-10 else 1.0 / (1.0 - r2)
+            vif_rows.append([names[j], r2, vif])
+        vif_table = pd.DataFrame(vif_rows, columns=['变量', 'R2(对其余解释变量回归)', 'VIF'])
+
+        self.diagnostic_tables_ = {
+            'std': std_table,
+            'corr_inv': corr_table,
+            'condition_number': cond_table,
+            'vif': vif_table,
+        }
+
+        if verbose:
+            print('\n========== 诊断模式：去均值后标准差 ==========')
+            print(std_table.round(6).to_string(index=False))
+
+            print('\n========== 诊断模式：ln_inv_l1 相关性 ==========')
+            print(corr_table.round(6).to_string(index=False))
+
+            print('\n========== 诊断模式：条件数 ==========')
+            print(cond_table.round(6).to_string(index=False))
+
+            print('\n========== 诊断模式：VIF ==========')
+            print(vif_table.round(6).to_string(index=False))
+
+        if out_path:
+            with pd.ExcelWriter(out_path) as writer:
+                std_table.to_excel(writer, sheet_name='std_demeaned', index=False)
+                corr_table.to_excel(writer, sheet_name='corr_with_ln_inv_l1', index=False)
+                cond_table.to_excel(writer, sheet_name='condition_number', index=False)
+                vif_table.to_excel(writer, sheet_name='vif', index=False)
+
     def save_results(self, out_prefix='sdm_main'):
         assert self.result_table_ is not None and self.impact_table_ is not None, '请先 fit()'
         self.result_table_.to_excel(f'{out_prefix}_coef.xlsx', index=False)
@@ -352,18 +446,19 @@ class TwoWayFESDM:
 def main():
     # 1. 读取主样本
     df = load_panel_data(
-        data_path='mathmatic/data/相关系数矩阵(1).xlsx',
+        data_path='data/相关系数矩阵(1).xlsx',
         years=(2011, 2023)
     )
     # print('数据预览：')
     # print(df.head().to_string(index=False))
 
     # 2. 主模型：邻接矩阵
-    W1 = load_weight_matrix('mathmatic/data/权重矩阵.xlsx', kind='adjacency')
+    W1 = load_weight_matrix('data/权重矩阵.xlsx', kind='adjacency')
     # print('空间权重矩阵 W1 预览：')
     # print(pd.DataFrame(W1, index=REGIONS, columns=REGIONS).round(4).to_string())
     model1 = TwoWayFESDM(df, W1)
     model1.fit()
+    model1.run_diagnostics(out_path='W1_sdm_diagnostics.xlsx', verbose=True)
 
     print('\n========== SDM 主回归结果（W1 邻接矩阵） ==========')
     print(model1.result_table_.round(4).to_string(index=False))
@@ -374,12 +469,13 @@ def main():
     model1.save_results('W1_sdm')
 
     # 3. 稳健性：距离倒数矩阵
-    W2 = load_weight_matrix('mathmatic/data/权重矩阵.xlsx', kind='distance_inverse')
+    W2 = load_weight_matrix('data/权重矩阵.xlsx', kind='distance_inverse')
     # print('空间权重矩阵 W2 预览：')
     # print(pd.DataFrame(W2, index=REGIONS, columns=REGIONS).round(4).to_string())
 
     model2 = TwoWayFESDM(df, W2)
     model2.fit()
+    model2.run_diagnostics(out_path='W2_sdm_diagnostics.xlsx', verbose=True)
     model2.save_results('W2_sdm')
 
     print('\n结果已保存：')
@@ -387,6 +483,8 @@ def main():
     print('- W1_sdm_impacts.xlsx')
     print('- W2_sdm_coef.xlsx')
     print('- W2_sdm_impacts.xlsx')
+    print('- W1_sdm_diagnostics.xlsx')
+    print('- W2_sdm_diagnostics.xlsx')
 
 
 if __name__ == '__main__':
