@@ -349,7 +349,7 @@ class TwoWayFESDM:
 
                 for x in self.x_names:
                     beta_d = float(coeffs_d[x])
-                    theta_d = float(coeffs_d[f'W_{x}'])
+                    theta_d = float(coeffs_d.get(f'W_{x}', 0.0))
                     S_d = A_inv_d @ (beta_d * np.eye(self.N) + theta_d * self.W)
 
                     direct_d = float(np.trace(S_d) / self.N)
@@ -581,8 +581,11 @@ def main():
                     '投资稳健p值': float(r.loc[inv_col, '稳健p值(线性部分)']),
                     '条件数': float(np.linalg.cond(m.Z)),
                     '状态': 'ok',
+                    '备注': '',
                 })
             except Exception as ex:
+                ex_msg = str(ex)
+                note = '程序分支异常（非估计失败）' if "'W_ln_inv_l1'" in ex_msg else '估计失败'
                 rows.append({
                     '实验': f'lag{lag}_full_sdm',
                     '样本量': len(dlag),
@@ -595,6 +598,7 @@ def main():
                     '投资稳健p值': np.nan,
                     '条件数': np.nan,
                     '状态': f'fail: {ex}',
+                    '备注': note,
                 })
 
         # 分步回归（lag1）
@@ -620,8 +624,11 @@ def main():
                     '投资稳健p值': float(r.loc['ln_inv_l1', '稳健p值(线性部分)']),
                     '条件数': float(np.linalg.cond(m.Z)),
                     '状态': 'ok',
+                    '备注': '',
                 })
             except Exception as ex:
+                ex_msg = str(ex)
+                note = '程序分支异常（非估计失败）' if "'W_ln_inv_l1'" in ex_msg else '估计失败'
                 rows.append({
                     '实验': name,
                     '样本量': len(df_base),
@@ -634,10 +641,22 @@ def main():
                     '投资稳健p值': np.nan,
                     '条件数': np.nan,
                     '状态': f'fail: {ex}',
+                    '备注': note,
                 })
 
         out = pd.DataFrame(rows)
         out.to_excel('W1_sensitivity_checks.xlsx', index=False)
+        out_refined = out.copy()
+        out_refined['结果判定'] = np.where(
+            out_refined['状态'].astype(str).str.startswith('ok'),
+            '估计成功',
+            np.where(
+                out_refined['备注'].eq('程序分支异常（非估计失败）'),
+                '程序分支异常（非估计失败）',
+                '估计失败'
+            )
+        )
+        out_refined.to_excel('W1_sensitivity_checks_refined.xlsx', index=False)
         print('\n========== 敏感性分析（滞后/分步/稳健SE） ==========')
         print(out.round(4).to_string(index=False))
 
@@ -702,6 +721,7 @@ def main():
     print('- W2_sdm_diagnostics.xlsx')
     print('- W1_condition_number_compare.xlsx')
     print('- W1_sensitivity_checks.xlsx')
+    print('- W1_sensitivity_checks_refined.xlsx')
 
 
 if __name__ == '__main__':
