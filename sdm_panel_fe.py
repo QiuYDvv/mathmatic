@@ -349,7 +349,7 @@ class TwoWayFESDM:
 
                 for x in self.x_names:
                     beta_d = float(coeffs_d[x])
-                    theta_d = float(coeffs_d[f'W_{x}'])
+                    theta_d = float(coeffs_d.get(f'W_{x}', 0.0))
                     S_d = A_inv_d @ (beta_d * np.eye(self.N) + theta_d * self.W)
 
                     direct_d = float(np.trace(S_d) / self.N)
@@ -581,8 +581,11 @@ def main():
                     '投资稳健p值': float(r.loc[inv_col, '稳健p值(线性部分)']),
                     '条件数': float(np.linalg.cond(m.Z)),
                     '状态': 'ok',
+                    '备注': '',
                 })
             except Exception as ex:
+                ex_msg = str(ex)
+                note = '程序分支异常（非估计失败）' if "'W_ln_inv_l1'" in ex_msg else '估计失败'
                 rows.append({
                     '实验': f'lag{lag}_full_sdm',
                     '样本量': len(dlag),
@@ -595,6 +598,7 @@ def main():
                     '投资稳健p值': np.nan,
                     '条件数': np.nan,
                     '状态': f'fail: {ex}',
+                    '备注': note,
                 })
 
         # 分步回归（lag1）
@@ -620,8 +624,11 @@ def main():
                     '投资稳健p值': float(r.loc['ln_inv_l1', '稳健p值(线性部分)']),
                     '条件数': float(np.linalg.cond(m.Z)),
                     '状态': 'ok',
+                    '备注': '',
                 })
             except Exception as ex:
+                ex_msg = str(ex)
+                note = '程序分支异常（非估计失败）' if "'W_ln_inv_l1'" in ex_msg else '估计失败'
                 rows.append({
                     '实验': name,
                     '样本量': len(df_base),
@@ -634,10 +641,22 @@ def main():
                     '投资稳健p值': np.nan,
                     '条件数': np.nan,
                     '状态': f'fail: {ex}',
+                    '备注': note,
                 })
 
         out = pd.DataFrame(rows)
         out.to_excel('W1_sensitivity_checks.xlsx', index=False)
+        out_refined = out.copy()
+        out_refined['结果判定'] = np.where(
+            out_refined['状态'].astype(str).str.startswith('ok'),
+            '估计成功',
+            np.where(
+                out_refined['备注'].eq('程序分支异常（非估计失败）'),
+                '程序分支异常（非估计失败）',
+                '估计失败'
+            )
+        )
+        out_refined.to_excel('W1_sensitivity_checks_refined.xlsx', index=False)
         print('\n========== 敏感性分析（滞后/分步/稳健SE） ==========')
         print(out.round(4).to_string(index=False))
 
@@ -649,59 +668,65 @@ def main():
     # print('数据预览：')
     # print(df.head().to_string(index=False))
 
-    # 2. 主模型：邻接矩阵
+    # 2. 主模型：默认切换为 lag2（ln_inv_l2）
+    df_main, main_inv_col = build_lag_df(df, lag_order=2)
+    x_main = [main_inv_col, 'ln_gdppc', 'urb', 'ind2', 'rd']
+
+    # 2.1 邻接矩阵
     W1 = load_weight_matrix('data/权重矩阵.xlsx', kind='adjacency')
     # print('空间权重矩阵 W1 预览：')
     # print(pd.DataFrame(W1, index=REGIONS, columns=REGIONS).round(4).to_string())
-    model1 = TwoWayFESDM(df, W1)
+    model1 = TwoWayFESDM(df_main, W1, x_names=x_main, include_wx=True)
     model1.fit()
-    model1.run_diagnostics(out_path='W1_sdm_diagnostics.xlsx', verbose=True)
+    model1.run_diagnostics(out_path='W1_main_lag2_diagnostics.xlsx', verbose=True)
 
-    print('\n========== SDM 主回归结果（W1 邻接矩阵） ==========')
+    print('\n========== SDM 主回归结果（W1 邻接矩阵, lag2） ==========')
     print(model1.result_table_.round(4).to_string(index=False))
 
-    print('\n========== impacts 效应分解（W1 邻接矩阵） ==========')
+    print('\n========== impacts 效应分解（W1 邻接矩阵, lag2） ==========')
     print(model1.impact_table_.round(4).to_string(index=False))
 
-    model1.save_results('W1_sdm')
+    model1.save_results('W1_main_lag2')
 
-    # 3. 稳健性：距离倒数矩阵
+    # 3. 稳健性：距离倒数矩阵（lag2）
     W2 = load_weight_matrix('data/权重矩阵.xlsx', kind='distance_inverse')
     # print('空间权重矩阵 W2 预览：')
     # print(pd.DataFrame(W2, index=REGIONS, columns=REGIONS).round(4).to_string())
 
-    model2 = TwoWayFESDM(df, W2)
+    model2 = TwoWayFESDM(df_main, W2, x_names=x_main, include_wx=True)
     model2.fit()
-    model2.run_diagnostics(out_path='W2_sdm_diagnostics.xlsx', verbose=True)
-    model2.save_results('W2_sdm')
+    model2.run_diagnostics(out_path='W2_main_lag2_diagnostics.xlsx', verbose=True)
+    model2.save_results('W2_main_lag2')
 
     # 4. 用户关注项专项检查（以 W1 为主）
     # 4.1 变量标准化后重估（查看条件数是否下降）
-    x_base = ['ln_inv_l1', 'ln_gdppc', 'urb', 'ind2', 'rd']
+    x_base = [main_inv_col, 'ln_gdppc', 'urb', 'ind2', 'rd']
     df_std = standardize_columns(df, x_base)
-    model1_std = TwoWayFESDM(df_std, W1, x_names=x_base, include_wx=True).fit()
+    df_std_main, _ = build_lag_df(df_std, lag_order=2)
+    model1_std = TwoWayFESDM(df_std_main, W1, x_names=x_base, include_wx=True).fit()
     cond_raw = float(np.linalg.cond(model1.Z))
     cond_std = float(np.linalg.cond(model1_std.Z))
     pd.DataFrame(
-        [{'模型': 'W1_raw', '条件数': cond_raw}, {'模型': 'W1_standardized_X', '条件数': cond_std}]
+        [{'模型': 'W1_lag2_raw', '条件数': cond_raw}, {'模型': 'W1_lag2_standardized_X', '条件数': cond_std}]
     ).to_excel('W1_condition_number_compare.xlsx', index=False)
     print('\n========== 标准化前后条件数对比（W1） ==========')
     print(pd.DataFrame(
-        [{'模型': 'W1_raw', '条件数': cond_raw}, {'模型': 'W1_standardized_X', '条件数': cond_std}]
+        [{'模型': 'W1_lag2_raw', '条件数': cond_raw}, {'模型': 'W1_lag2_standardized_X', '条件数': cond_std}]
     ).round(4).to_string(index=False))
 
     # 4.2 投资滞后2/3期 + 分步回归 + 稳健SE对比
     run_stepwise_and_lag_checks(df, W1)
 
     print('\n结果已保存：')
-    print('- W1_sdm_coef.xlsx')
-    print('- W1_sdm_impacts.xlsx')
-    print('- W2_sdm_coef.xlsx')
-    print('- W2_sdm_impacts.xlsx')
-    print('- W1_sdm_diagnostics.xlsx')
-    print('- W2_sdm_diagnostics.xlsx')
+    print('- W1_main_lag2_coef.xlsx')
+    print('- W1_main_lag2_impacts.xlsx')
+    print('- W2_main_lag2_coef.xlsx')
+    print('- W2_main_lag2_impacts.xlsx')
+    print('- W1_main_lag2_diagnostics.xlsx')
+    print('- W2_main_lag2_diagnostics.xlsx')
     print('- W1_condition_number_compare.xlsx')
     print('- W1_sensitivity_checks.xlsx')
+    print('- W1_sensitivity_checks_refined.xlsx')
 
 
 if __name__ == '__main__':
