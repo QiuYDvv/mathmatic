@@ -710,8 +710,8 @@ def main():
     # 4. 用户关注项专项检查（以 W1 为主）
     # 4.1 变量标准化后重估（查看条件数是否下降）
     x_base = [main_inv_col, 'ln_gdppc', 'urb', 'ind2', 'rd']
-    df_std = standardize_columns(df, x_base)
-    df_std_main, _ = build_lag_df(df_std, lag_order=2)
+    # 注意：main_inv_col=ln_inv_l2 只在 df_main 中存在，故直接在 df_main 上标准化
+    df_std_main = standardize_columns(df_main, x_base)
     model1_std = TwoWayFESDM(df_std_main, W1, x_names=x_base, include_wx=True).fit()
     cond_raw = float(np.linalg.cond(model1.Z))
     cond_std = float(np.linalg.cond(model1_std.Z))
